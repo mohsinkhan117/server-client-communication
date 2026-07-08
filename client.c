@@ -6,6 +6,8 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <pthread.h>
 
 #define DEFAULT_PORT 8080
 #define BUFFER_SIZE 4096
@@ -44,6 +46,11 @@ char g_server_ip[INET6_ADDRSTRLEN] = "127.0.0.1";
 int g_port = DEFAULT_PORT;
 char g_local_ip[INET_ADDRSTRLEN] = "0.0.0.0";
 uint16_t g_local_port = 0;
+
+int g_sock = -1;
+volatile int g_connected = 0;
+pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
+const char *PROMPT = GREEN "➜ " RESET BOLD "Enter message (or 'exit' to quit): " RESET;
 
 char* get_timestamp_short() {
     static char timestamp[16];
@@ -160,6 +167,46 @@ void display_incoming_packet(const char *response, int length) {
     printf(BINARY "└──────────────────────────────────────────────────────────────┘" RESET "\n\n");
 }
 
+void display_stats(); // forward declaration; defined below
+
+// Runs for the whole life of the connection. The server can now send a
+// message at any time (an auto-ACK, or something the operator typed on
+// their end) -- this thread is what lets the client actually notice and
+// show it instead of only checking for a reply right after it sends.
+void* receiver_thread(void *arg) {
+    (void)arg;
+    char buf[BUFFER_SIZE];
+
+    while (g_connected) {
+        memset(buf, 0, sizeof(buf));
+        int n = read(g_sock, buf, sizeof(buf) - 1);
+
+        if (!g_connected) break; // socket was closed locally (user typed exit)
+
+        if (n <= 0) {
+            pthread_mutex_lock(&print_lock);
+            printf(WARNING "\n[%s] Server closed the connection.\n\n" RESET, get_timestamp_short());
+            pthread_mutex_unlock(&print_lock);
+            g_connected = 0;
+            display_stats();
+            printf(GREEN "╔════════════════════════════════════════════════════════════════╗" RESET "\n");
+            printf(GREEN "║" RESET SUCCESS " ✓ CLIENT SHUTDOWN - CONNECTION CLOSED BY SERVER " RESET GREEN "║" RESET "\n");
+            printf(GREEN "╚════════════════════════════════════════════════════════════════╝\n" RESET);
+            fflush(stdout);
+            exit(0);
+        }
+
+        buf[n] = '\0';
+
+        pthread_mutex_lock(&print_lock);
+        display_incoming_packet(buf, n);
+        printf("%s", PROMPT);
+        fflush(stdout);
+        pthread_mutex_unlock(&print_lock);
+    }
+    return NULL;
+}
+
 void display_stats() {
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -178,6 +225,7 @@ void display_stats() {
     printf(MAGENTA "║" RESET " Avg Throughput   : %.2f B/s\n", avg_throughput);
     printf(MAGENTA "╚════════════════════════════════════════════════════════════╝" RESET "\n\n");
 }
+
 
 void print_banner() {
     printf(DARK_GREEN);
@@ -268,7 +316,6 @@ int main(int argc, char *argv[]) {
     int sock = 0;
     struct sockaddr_in serv_addr;
     char input_msg[BUFFER_SIZE] = {0};
-    char response[BUFFER_SIZE] = {0};
 
     // ---- Get server IP / port, either from the terminal args or by asking ----
     // This client is meant to run on a *different* machine from the server,
@@ -338,26 +385,43 @@ int main(int argc, char *argv[]) {
     }
 
     gettimeofday(&session_start, NULL);
+    g_sock = sock;
+    g_connected = 1;
 
     // Display connection established
     printf(GREEN "╔════════════════════════════════════════════════════════════════╗" RESET "\n");
     printf(GREEN "║" RESET SUCCESS " ✓ CONNECTED TO SERVER [FD: %d] " RESET GREEN "                  ║" RESET "\n", sock);
     printf(GREEN "╚════════════════════════════════════════════════════════════════╝\n" RESET);
     printf(BRIGHT_GREEN "  Connected: %s:%d\n" RESET, g_server_ip, g_port);
-    printf(CYAN "  Status: Bidirectional communication active\n\n" RESET);
+    printf(CYAN "  Status: Bidirectional communication active - the server can message\n" RESET);
+    printf(CYAN "          you at any time, not just as a reply to what you send\n\n" RESET);
 
     display_socket_info(sock);
 
-    // Communication loop
+    // A dedicated thread owns all reading from the socket, so a message the
+    // server operator sends unprompted shows up the instant it arrives,
+    // instead of only being visible as a reply to something we just sent.
+    pthread_t recv_tid;
+    if (pthread_create(&recv_tid, NULL, receiver_thread, NULL) != 0) {
+        printf(ERROR "✗ Failed to start receiver thread\n\n" RESET);
+        close(sock);
+        return -1;
+    }
+    pthread_detach(recv_tid);
+
+    // Communication loop (sending only - receiving happens in receiver_thread)
     int msg_counter = 1;
-    while (1) {
-        printf(GREEN "➜ " RESET BOLD "Enter message (or 'exit' to quit): " RESET);
+    while (g_connected) {
+        pthread_mutex_lock(&print_lock);
+        printf("%s", PROMPT);
         fflush(stdout);
+        pthread_mutex_unlock(&print_lock);
 
         if (fgets(input_msg, sizeof(input_msg), stdin) == NULL) {
             printf(ERROR "✗ Input error\n\n" RESET);
             break;
         }
+        if (!g_connected) break; // server hung up while we were typing
 
         // Remove newline
         input_msg[strcspn(input_msg, "\n")] = 0;
@@ -382,8 +446,9 @@ int main(int argc, char *argv[]) {
 
         int bytes_to_send = strlen(input_msg);
 
-        // Display outgoing packet
+        pthread_mutex_lock(&print_lock);
         display_outgoing_packet(msg_counter, input_msg, bytes_to_send);
+        pthread_mutex_unlock(&print_lock);
         usleep(300000);
 
         // Send data
@@ -392,39 +457,16 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        printf(SUCCESS "  ✓ Packet transmitted successfully\n" RESET);
-        usleep(400000);
-
-        // Receive response
-        memset(response, 0, BUFFER_SIZE);
-        int bytes_received = read(sock, response, BUFFER_SIZE - 1);
-
-        if (bytes_received < 0) {
-            printf(ERROR "✗ Reception error\n\n" RESET);
-            break;
-        }
-
-        if (bytes_received == 0) {
-            printf(YELLOW "[%s] " RESET WARNING "Server closed connection\n\n" RESET, get_timestamp_short());
-            break;
-        }
-
-        response[bytes_received] = '\0';
-
-        // Display incoming response
-        display_incoming_packet(response, bytes_received);
-        usleep(300000);
-
-        printf(GREEN "  ╔═══════════════════════════════════════════════════════════╗" RESET "\n");
-        printf(GREEN "  ║ " RESET SUCCESS "✓ ROUND-TRIP COMPLETE & ACKNOWLEDGED" RESET GREEN " ║" RESET "\n");
-        printf(GREEN "  ╚═══════════════════════════════════════════════════════════╝" RESET "\n\n");
+        printf(SUCCESS "  ✓ Packet transmitted successfully - awaiting reply asynchronously...\n\n" RESET);
 
         msg_counter++;
-        usleep(500000);
     }
 
     // Cleanup
+    g_connected = 0;
+    shutdown(sock, SHUT_RDWR); // unblocks the receiver thread's read()
     close(sock);
+    usleep(100000); // give the receiver thread a moment to notice and stop touching the fd
 
     display_stats();
 
