@@ -62,6 +62,8 @@ typedef struct {
     uint16_t client_port;
     char local_ip[INET_ADDRSTRLEN];
     uint16_t local_port;
+    pthread_mutex_t write_lock; // serializes writes to this socket between
+                                // the auto-ACK reply and operator messages
 } Client;
 
 typedef struct {
@@ -81,6 +83,10 @@ volatile long packet_sequence = 0;
 int g_port = DEFAULT_PORT;
 char g_bind_ip[INET_ADDRSTRLEN] = "0.0.0.0";   // what we bind to (may be a wildcard)
 char g_display_ip[INET_ADDRSTRLEN] = "0.0.0.0"; // the real address we show in the UI
+int g_server_fd = -1;                          // listening socket, so the console
+                                                // thread can unblock accept() on /quit
+pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER; // keeps multiple threads'
+                                                         // output from interleaving
 
 // ============== Utility Functions ==============
 char* get_timestamp_precise() {
@@ -291,6 +297,7 @@ void display_socket_info(int sock_fd, int client_id, char *out_local_ip, uint16_
 }
 
 void display_clients_list() {
+    pthread_mutex_lock(&print_lock);
     pthread_mutex_lock(&server_state.lock);
 
     time_t now = time(NULL);
@@ -336,6 +343,7 @@ void display_clients_list() {
     printf(MAGENTA "╚═══════════════════════════════════════════════════════════════════════╝" RESET "\n\n");
 
     pthread_mutex_unlock(&server_state.lock);
+    pthread_mutex_unlock(&print_lock);
 }
 
 // ============== Packet Display Functions ==============
@@ -422,13 +430,15 @@ void* handle_client(void *arg) {
         server_state.total_packets++;
         pthread_mutex_unlock(&server_state.lock);
 
+        pthread_mutex_lock(&print_lock);
+
         // Display incoming packet
         display_incoming_packet(client->client_id, client->client_ip, client->client_port,
                                  client->local_ip, client->local_port, buffer, bytes_read);
 
         // Generate response with timestamp and server info
         int response_len = snprintf(response, sizeof(response),
-                                   "[%s] ACK→ Server received (%d bytes): %.256s",
+                                   "[%s] ACK<- Server received (%d bytes): %.256s",
                                    get_timestamp_short(), bytes_read, buffer);
 
         usleep(300000);
@@ -436,10 +446,16 @@ void* handle_client(void *arg) {
         // Display outgoing packet
         display_outgoing_packet(client->client_id, client->local_ip, client->local_port, response, response_len);
 
-        // Send response
-        if (write(client->socket_fd, response, response_len) < 0) {
+        // Send response (write_lock keeps this from colliding with an
+        // operator-typed message going out on the same socket)
+        pthread_mutex_lock(&client->write_lock);
+        int written = write(client->socket_fd, response, response_len);
+        pthread_mutex_unlock(&client->write_lock);
+
+        if (written < 0) {
             printf(ERROR "[%s] Failed to send response to client #%d\n\n" RESET,
                    get_timestamp_short(), client->client_id);
+            pthread_mutex_unlock(&print_lock);
             break;
         }
 
@@ -449,7 +465,9 @@ void* handle_client(void *arg) {
         pthread_mutex_unlock(&server_state.lock);
 
         printf(SUCCESS "\n  ✓ Packet transmitted successfully\n" RESET);
-        printf(INFO "  └─ Round-trip complete (waiting for next message...)\n\n" RESET);
+        printf(INFO "  └─ Round-trip complete (waiting for next message, or an operator reply...)\n\n" RESET);
+
+        pthread_mutex_unlock(&print_lock);
 
         usleep(500000);
     }
@@ -463,6 +481,133 @@ void* handle_client(void *arg) {
 
     printf(GRAY "\n[%s] " RESET WARNING "Client #%d connection terminated. Cleaned up resources.\n\n" RESET,
            get_timestamp_short(), client->client_id);
+
+    return NULL;
+}
+
+// ============== Operator Console (server -> client messaging) ==============
+void print_console_help() {
+    pthread_mutex_lock(&print_lock);
+    printf(INFO "\n┌─ SERVER CONSOLE COMMANDS ───────────────────────────────────┐" RESET "\n");
+    printf(INFO "│" RESET " @<id> <message>   Send a message to client <id>\n");
+    printf(INFO "│" RESET " @all <message>    Broadcast a message to every client\n");
+    printf(INFO "│" RESET " /list             Show connected clients\n");
+    printf(INFO "│" RESET " /help             Show this help\n");
+    printf(INFO "│" RESET " /quit             Shut down the server\n");
+    printf(INFO "└─────────────────────────────────────────────────────────────┘" RESET "\n\n");
+    pthread_mutex_unlock(&print_lock);
+}
+
+// Sends an operator-typed message to one connected client. Returns bytes
+// written, or -1 if that client isn't active / the write failed.
+int send_to_client(int client_index, const char *msg) {
+    pthread_mutex_lock(&server_state.lock);
+    Client *c = &server_state.clients[client_index];
+    int active = c->active;
+    int fd = c->socket_fd;
+    int client_id = c->client_id;
+    pthread_mutex_unlock(&server_state.lock);
+
+    if (!active) return -1;
+
+    char formatted[BUFFER_SIZE];
+    int len = snprintf(formatted, sizeof(formatted), "[%s] MSG<- Server operator: %.4000s",
+                        get_timestamp_short(), msg);
+
+    pthread_mutex_lock(&c->write_lock);
+    int result = write(fd, formatted, len);
+    pthread_mutex_unlock(&c->write_lock);
+
+    pthread_mutex_lock(&print_lock);
+    if (result > 0) {
+        pthread_mutex_lock(&server_state.lock);
+        c->bytes_sent += result;
+        server_state.total_bytes_exchanged += result;
+        pthread_mutex_unlock(&server_state.lock);
+        printf(SUCCESS "  ✓ Sent %d bytes to client #%d: \"%s\"\n\n" RESET, result, client_id, msg);
+    } else {
+        printf(ERROR "  ✗ Failed to send to client #%d\n\n" RESET, client_id);
+    }
+    pthread_mutex_unlock(&print_lock);
+
+    return result;
+}
+
+void* console_thread(void *arg) {
+    (void)arg;
+    char line[BUFFER_SIZE];
+
+    print_console_help();
+
+    while (server_running) {
+        printf(BOLD "server> " RESET);
+        fflush(stdout);
+
+        if (fgets(line, sizeof(line), stdin) == NULL) break;
+        line[strcspn(line, "\n")] = 0;
+
+        if (strlen(line) == 0) continue;
+
+        if (strcmp(line, "/help") == 0) {
+            print_console_help();
+            continue;
+        }
+
+        if (strcmp(line, "/list") == 0) {
+            display_clients_list();
+            continue;
+        }
+
+        if (strcmp(line, "/quit") == 0) {
+            pthread_mutex_lock(&print_lock);
+            printf(WARNING "\nShutting down server...\n\n" RESET);
+            pthread_mutex_unlock(&print_lock);
+            server_running = 0;
+            if (g_server_fd >= 0) shutdown(g_server_fd, SHUT_RDWR);
+            break;
+        }
+
+        if (line[0] == '@') {
+            char *space = strchr(line, ' ');
+            if (!space || strlen(space + 1) == 0) {
+                printf(WARNING "Usage: @<id|all> <message>\n\n" RESET);
+                continue;
+            }
+
+            char target[32];
+            size_t idlen = (size_t)(space - (line + 1));
+            if (idlen >= sizeof(target)) idlen = sizeof(target) - 1;
+            strncpy(target, line + 1, idlen);
+            target[idlen] = '\0';
+            const char *msg = space + 1;
+
+            if (strcmp(target, "all") == 0) {
+                int ids[MAX_CLIENTS], count = 0;
+                pthread_mutex_lock(&server_state.lock);
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (server_state.clients[i].active) ids[count++] = i;
+                }
+                pthread_mutex_unlock(&server_state.lock);
+
+                if (count == 0) {
+                    printf(WARNING "⚠ No active clients to send to\n\n" RESET);
+                } else {
+                    for (int k = 0; k < count; k++) send_to_client(ids[k], msg);
+                }
+            } else {
+                char *endptr;
+                long id = strtol(target, &endptr, 10);
+                if (*endptr != '\0' || id < 1 || id > MAX_CLIENTS) {
+                    printf(ERROR "Invalid client id: %s\n\n" RESET, target);
+                    continue;
+                }
+                send_to_client((int)(id - 1), msg);
+            }
+            continue;
+        }
+
+        printf(WARNING "Unknown command. Type /help for options.\n\n" RESET);
+    }
 
     return NULL;
 }
@@ -516,8 +661,11 @@ int main(int argc, char *argv[]) {
     display_system_info();
     display_server_process_info(server_pid);
 
-    // Initialize mutex
+    // Initialize mutexes
     pthread_mutex_init(&server_state.lock, NULL);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        pthread_mutex_init(&server_state.clients[i].write_lock, NULL);
+    }
 
     // Create socket
     printf(GRAY "[%s] " RESET "Creating TCP/IPv4 socket...\n", get_timestamp_short());
@@ -570,8 +718,19 @@ int main(int argc, char *argv[]) {
     }
     printf(SUCCESS "  ✓ Listening for incoming connections\n" RESET);
 
+    g_server_fd = server_fd;
+
     printf(WARNING "\n[%s] " RESET "Awaiting client connections on %s:%d...\n\n" RESET,
            get_timestamp_short(), g_display_ip, g_port);
+
+    // Operator console: lets you type real messages to send to connected
+    // clients (@<id> <msg>, @all <msg>) instead of only the automatic ACK.
+    pthread_t console_tid;
+    if (pthread_create(&console_tid, NULL, console_thread, NULL) != 0) {
+        printf(WARNING "  ⚠ Could not start operator console (server will still auto-ACK clients)\n\n" RESET);
+    } else {
+        pthread_detach(console_tid);
+    }
 
     // Main acceptance loop
     while (server_running) {
@@ -627,13 +786,16 @@ int main(int argc, char *argv[]) {
         pthread_mutex_unlock(&server_state.lock);
 
         // Print connection established
+        pthread_mutex_lock(&print_lock);
         printf(GREEN "╔════════════════════════════════════════════════════════════════╗" RESET "\n");
         printf(GREEN "║" RESET SUCCESS " ✓ CLIENT #%d CONNECTED [FD: %d] " RESET GREEN "                  ║" RESET "\n",
                client->client_id, client_fd);
         printf(GREEN "╚════════════════════════════════════════════════════════════════╝\n" RESET);
         printf(NEON_GREEN "  Client: %s:%d\n" RESET, client->client_ip, client->client_port);
         printf(NEON_GREEN "  Server: %s:%d\n" RESET, g_display_ip, g_port);
-        printf(GRAY "  Status: Bidirectional communication active\n\n" RESET);
+        printf(GRAY "  Status: Bidirectional communication active (type @%d <msg> in the server console to chat)\n\n" RESET,
+               client->client_id);
+        pthread_mutex_unlock(&print_lock);
 
         // Create thread for this client
         if (pthread_create(&client->thread_id, NULL, handle_client, client) != 0) {
